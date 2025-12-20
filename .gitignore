@@ -1,0 +1,21 @@
+# Specify filepatterns you want git to ignore.
+.history/
+.idea/
+__pycache__/
+output/
+logs/
+checkpoints/
+wandb/
+pretrained_models/
+body_models/
+
+*.ipynb
+*.ui
+*.h5
+*.pth
+*.log
+*.ckpt
+*.tar
+*.out
+
+body_models/
