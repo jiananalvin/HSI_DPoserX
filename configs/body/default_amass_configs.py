@@ -18,7 +18,7 @@ def get_default_configs():
     training = config.training
     config.training.batch_size = 64  # 1280
     training.n_iters = 20000  # 200000
-    training.log_freq = 50
+    training.log_freq = 100   # Log every 100 iterations 
     training.eval_freq = 300  # 10000
     training.save_freq = 450  # 15000
     training.auxiliary_loss = True  # not recommended

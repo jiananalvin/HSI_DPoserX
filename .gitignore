@@ -17,5 +17,7 @@ body_models/
 *.ckpt
 *.tar
 *.out
+*.md
+!README.md
 
 body_models/

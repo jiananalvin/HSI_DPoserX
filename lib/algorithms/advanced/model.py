@@ -54,13 +54,9 @@ class TextPoseCrossAttention(nn.Module):
         pose_feat_norm = self.norm_pose(pose_feat)
         text_feat_norm = self.norm_text(text_feat)
         
-        # Project to queries/keys/values
-        q = self.q_proj(pose_feat_norm)  # [B, pose_hidden_dim]
-        k = self.k_proj(text_feat_norm)  # [B, pose_hidden_dim]
-        v = self.v_proj(text_feat_norm)  # [B, pose_hidden_dim]
-        
         # Reshape for multi-head attention
         B = pose_feat.shape[0]
+        # Project to queries/keys/values and reshape for multi-head attention
         # Add a dummy sequence dimension (1) for valid attention (text/pose are [B, D] → [B, 1, D])
         q = self.q_proj(pose_feat_norm).reshape(B, 1, self.num_heads, self.head_dim).transpose(1,2)  # [B, num_heads, 1, head_dim]
         k = self.k_proj(text_feat_norm).reshape(B, 1, self.num_heads, self.head_dim).transpose(1,2)  # [B, num_heads, 1, head_dim]

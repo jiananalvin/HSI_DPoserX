@@ -12,7 +12,6 @@ from torch import optim
 import cv2
 
 from lib.body_model.body_model import BodyModel
-from lib.body_model.visual import render_mesh
 from lib.utils.callbacks import TimerCallback, ModelSizeCallback
 from lib.utils.misc import create_mask
 from lib.utils.metric import average_pairwise_distance, self_intersections_percentage
@@ -29,7 +28,9 @@ from lib.utils.schedulers import CosineWarmupScheduler
 
 import open_clip
 import wandb
-from lib.utils.wandb_helpers import init_wandb, log_losses, log_metrics, log_rendered_images
+from lib.utils.wandb_helpers import init_wandb, log_dict_to_wandb
+from lib.utils.training_visualization import render_and_log_images
+from lib.utils.checkpoint_utils import load_pretrained_checkpoint_for_finetuning, set_requires_grad_for_text_conditioning_only
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='train diffusion model')
@@ -40,6 +41,8 @@ def parse_args(argv):
                         default='./body_models/smplx/SMPLX_NEUTRAL.npz',
                         help='load SMPLX for visualization')
     parser.add_argument('--resume-ckpt', '-r', type=str, help='resume training')
+    parser.add_argument('--pretrained-ckpt', type=str, help='load pretrained checkpoint (without text conditioning) for fine-tuning')
+    parser.add_argument('--freeze-pretrained', action='store_true', help='freeze pretrained parameters (only train text conditioning)')
     parser.add_argument('--data-root', type=str,
                         default='./data/body_data', help='dataset root')
     parser.add_argument('--version', type=str, default='version1', help='dataset version')
@@ -57,7 +60,9 @@ class DPoserTrainer(pl.LightningModule):
                  data_path='',
                  N_POSES=21,
                  train_loader=None,
-                 val_loader=None):
+                 val_loader=None,
+                 pretrained_ckpt=None,
+                 freeze_pretrained=False):
         super().__init__()
         self.config = config
         self.bodymodel_path = bodymodel_path
@@ -65,6 +70,8 @@ class DPoserTrainer(pl.LightningModule):
         self.N_POSES = N_POSES
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.pretrained_ckpt = pretrained_ckpt
+        self.freeze_pretrained = freeze_pretrained
         self.save_hyperparameters(ignore=['train_loader', 'val_loader'])
 
         # CLIP
@@ -82,7 +89,7 @@ class DPoserTrainer(pl.LightningModule):
 
         # Diffusion model
         self.POSE_DIM = 3 if config.data.rot_rep == 'axis' else 6
-        self.model = create_model(config.model, N_POSES, self.POSE_DIM)
+        self.model = create_model(config.model, N_POSES, self.POSE_DIM, text_embedding_dim=self.text_embedding_dim)
         self.model_ema = None
 
         # Body models
@@ -141,6 +148,28 @@ class DPoserTrainer(pl.LightningModule):
             self.model_ema = ExponentialMovingAverage(self.model.parameters(),
                                                       decay=self.config.model.ema_rate,
                                                       device=self.device)
+            
+            # Load pretrained checkpoint if provided (for fine-tuning from non-text model)
+            if self.pretrained_ckpt is not None:
+                print(f"🔄 Loading pretrained checkpoint from: {self.pretrained_ckpt}")
+                print(f"   This checkpoint doesn't have text conditioning - will initialize text layers randomly")
+                stats = load_pretrained_checkpoint_for_finetuning(
+                    self.model,
+                    self.pretrained_ckpt,
+                    device=self.device,
+                    strict=False,  # Allow missing keys (text conditioning layers)
+                    is_ema=True,
+                    freeze_pretrained=self.freeze_pretrained
+                )
+                print(f"✅ Pretrained checkpoint loaded: {stats['loaded']} params loaded, {stats['missing']} missing (text conditioning)")
+                
+                if self.freeze_pretrained:
+                    print("🔒 Pretrained parameters are frozen - only text conditioning will be trained")
+                    print("   (Use this for two-stage fine-tuning: first train text layers, then unfreeze)")
+                else:
+                    print("🔓 All parameters are trainable (pretrained + text conditioning)")
+                    print("   (Recommended: fine-tune everything together)")
+            
             Normalizer = Posenormalizer(
                 data_path=self.data_path,
                 normalize=self.config.data.normalize,
@@ -158,6 +187,9 @@ class DPoserTrainer(pl.LightningModule):
 
     def setup_step_fn(self, config):
         # Build one-step training and evaluation functions
+        # NOTE: For text-to-pose training, auxiliary_loss=True is recommended to enable
+        # reconstruction loss (recon_mse/recon_mpjpe) which helps the model learn
+        # to reconstruct poses from text embeddings.
         kwargs = {}
         if config.training.auxiliary_loss:
             body_model_train = BodyModel(bm_path=self.bodymodel_path,
@@ -240,13 +272,16 @@ class DPoserTrainer(pl.LightningModule):
         # Forward pass and calculate loss
         loss_dict = self.train_step_fn(self.model, batch=poses, condition=text_embeds, mask=None)
 
-        log_losses(loss_dict, self.global_step, prefix="train")  # wandb logging
-
-        # Log the losses
+        # Log the losses (PyTorch Lightning respects log_every_n_steps)
         for key, value in loss_dict.items():
             self.log(f"{key}", value, prog_bar=True, logger=True)
 
-        return loss_dict['loss']  # Assuming 'loss' is a key in your loss_dict
+        # Log to wandb only every log_freq steps (to reduce logging overhead)
+        if self.global_step % self.config.training.log_freq == 0:
+            loss_dict_scalar = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+            log_dict_to_wandb(loss_dict_scalar, self.global_step, prefix="train")
+
+        return loss_dict['loss']
 
     def on_train_batch_end(self, *args):
         self.model_ema.update(self.model.parameters())
@@ -257,25 +292,6 @@ class DPoserTrainer(pl.LightningModule):
         self.model_ema.copy_to(self.model.parameters())
         self.compfn = DPoserComp(self.model, self.sde,
                                  self.config.training.continuous,)
-
-    # def validation_step(self, batch, batch_idx):
-    #     poses = self.normalize_fn(batch['body_pose'], from_axis=True)
-    #     # Process the batch and calculate metrics
-    #     text_embeds_val = self.encode_text(batch['caption'])
-    #     eval_metrics, trajs, samples = self.process_validation_batch(poses, text_embeds_val)
-    #     self.all_samples.append(samples)
-
-    #     # Store trajs of the last batch
-    #     if batch_idx == len(self.val_dataloader()) - 1:
-    #         self.last_trajs = trajs
-
-    #     log_metrics(eval_metrics, self.global_step, prefix="val")  # wandb logging
-
-    #     # Log calculated metrics
-    #     for metric_name, metric_value in eval_metrics.items():
-    #         self.log(f'val_{metric_name}', metric_value, sync_dist=True, logger=True)
-
-    #     return eval_metrics
     
     def validation_step(self, batch, batch_idx):
         poses = self.normalize_fn(batch['body_pose'], from_axis=True)
@@ -301,15 +317,18 @@ class DPoserTrainer(pl.LightningModule):
 
         # --------------------------
         # 🔴 Step 2: Add reconstruction metrics to eval_metrics
+        # Note: recon_mse and recon_mpjpe are only computed when auxiliary_loss=True
         # --------------------------
-        eval_metrics['recon_mse'] = loss_dict['recon_mse'].item()
-        eval_metrics['recon_mpjpe'] = loss_dict['recon_mpjpe'].item()
+        recon_mse_val = loss_dict.get('recon_mse', torch.tensor(0.0))
+        recon_mpjpe_val = loss_dict.get('recon_mpjpe', torch.tensor(0.0))
+        eval_metrics['recon_mse'] = recon_mse_val.item() if isinstance(recon_mse_val, torch.Tensor) else recon_mse_val
+        eval_metrics['recon_mpjpe'] = recon_mpjpe_val.item() if isinstance(recon_mpjpe_val, torch.Tensor) else recon_mpjpe_val
         eval_metrics['score_loss'] = loss_dict['score_loss'].item()  # Optional: pure diffusion loss
 
         # --------------------------
-        # Original logging (now includes reconstruction metrics)
+        # logging
         # --------------------------
-        log_metrics(eval_metrics, self.global_step, prefix="val")
+        log_dict_to_wandb(eval_metrics, self.global_step, prefix="val")
         for metric_name, metric_value in eval_metrics.items():
             self.log(
                 f'val_{metric_name}', 
@@ -321,21 +340,24 @@ class DPoserTrainer(pl.LightningModule):
             )
         
         # 🔴 Step 3: Explicitly log reconstruction metrics (for clear curves)
-        self.log(
-            'val_recon_mse', 
-            loss_dict['recon_mse'], 
-            sync_dist=True, 
-            logger=True,
-            batch_size=poses.shape[0],
-            prog_bar=True  # Show in progress bar for real-time monitoring
-        )
-        self.log(
-            'val_recon_mpjpe', 
-            loss_dict['recon_mpjpe'], 
-            sync_dist=True, 
-            logger=True,
-            batch_size=poses.shape[0]
-        )
+        # Only log if reconstruction metrics were actually computed (auxiliary_loss=True)
+        if 'recon_mse' in loss_dict and loss_dict['recon_mse'] != 0.0:
+            self.log(
+                'val_recon_mse', 
+                loss_dict['recon_mse'], 
+                sync_dist=True, 
+                logger=True,
+                batch_size=poses.shape[0],
+                prog_bar=True  # Show in progress bar for real-time monitoring
+            )
+        if 'recon_mpjpe' in loss_dict and loss_dict['recon_mpjpe'] != 0.0:
+            self.log(
+                'val_recon_mpjpe', 
+                loss_dict['recon_mpjpe'], 
+                sync_dist=True, 
+                logger=True,
+                batch_size=poses.shape[0]
+            )
         
         return eval_metrics
 
@@ -371,7 +393,7 @@ class DPoserTrainer(pl.LightningModule):
         body_joints3d = joints3d[:, :22, :]
         APD = average_pairwise_distance(body_joints3d)
         SI = self_intersections_percentage(body_out.v, body_out.f).mean()
-        log_metrics({'APD': APD.item(), 'SI': SI.item()}, self.global_step, prefix="val")  # wandb logging
+        log_dict_to_wandb({'APD': APD.item(), 'SI': SI.item()}, self.global_step, prefix="val")
         self.log('APD', APD.item(), sync_dist=True, logger=True)
         self.log('SI', SI.item(), sync_dist=True, logger=True)
 
@@ -416,269 +438,16 @@ class DPoserTrainer(pl.LightningModule):
 
         return eval_metrics, trajs, samples
 
-    # def render_and_log_images(self, trajs, all_results):
-    #     bg_img = np.ones([512, 384, 3]) * 255  # background canvas
-    #     focal = [1500, 1500]
-    #     princpt = [200, 192]
-
-    #     # Sample some frames for visualization
-    #     slice_step = self.sde.N // 10
-    #     trajs = self.denormalize_fn(trajs[::slice_step, :5, ], to_axis=True).reshape(50, -1)  # [10time, 5sample, j*6]
-    #     all_results = self.denormalize_fn(all_results[:50], to_axis=True)  # [50, j*6]
-
-    #     # Process and log trajs
-    #     traj_grid = self.process_and_log_meshes(trajs, bg_img, focal, princpt, 'trajs')
-
-    #     # Process and log samples
-    #     sample_grid = self.process_and_log_meshes(all_results, bg_img, focal, princpt, 'samples')
-
-    #     # wandb logging
-    #     log_rendered_images(traj_grid, self.global_step, "val/trajs_grid")
-    #     log_rendered_images(sample_grid, self.global_step, "val/samples_grid")
     
     def render_and_log_images(self, trajs, all_results):
-        bg_img = np.ones([512, 384, 3]) * 255
-        focal = [1500, 1500]
-        princpt = [200, 192]
+        """Render and log images using training visualization utilities."""
+        render_and_log_images(
+            trajs, all_results,
+            self.denormalize_fn, self.sde,
+            self.body_model_vis, self.logger, self.global_step, self.current_epoch,
+            text_prompts=self.last_text_prompts, pose_dim=self.POSE_DIM
+        )
 
-        # Sample frames (unchanged)
-        slice_step = self.sde.N // 10
-        trajs = self.denormalize_fn(trajs[::slice_step, :5, ], to_axis=True).reshape(50, -1)
-        all_results = self.denormalize_fn(all_results[:50], to_axis=True)
-
-        # Pass text prompts to process_and_log_meshes
-        traj_grid = self.process_and_log_meshes(trajs, bg_img, focal, princpt, 'trajs', text_prompts=self.last_text_prompts)
-        sample_grid = self.process_and_log_meshes(all_results, bg_img, focal, princpt, 'samples', text_prompts=self.last_text_prompts)
-
-        # wandb logging (unchanged)
-        log_rendered_images(traj_grid, self.global_step, "val/trajs_grid")
-        log_rendered_images(sample_grid, self.global_step, "val/samples_grid")
-
-    # def process_and_log_meshes(self, poses, bg_img, focal, princpt, tag_prefix):
-    #     body_out = self.body_model_vis(body_pose=poses)
-    #     meshes = body_out.v.detach().cpu().numpy()
-    #     faces = body_out.f.cpu().numpy()
-
-    #     rendered_images = []
-    #     for mesh in meshes:
-    #         rendered_img = render_mesh(bg_img, mesh, faces, {'focal': focal, 'princpt': princpt})
-    #         rendered_img_tensor = self.convert_to_tensor(rendered_img)
-    #         rendered_images.append(rendered_img_tensor)
-
-    #     # Create an image grid and log it
-    #     image_grid = torchvision.utils.make_grid(rendered_images, nrow=10)  # 10 columns
-    #     self.logger.experiment.add_image(f'{tag_prefix}_grid', image_grid, self.current_epoch)
-
-    def process_and_log_meshes(self, poses, bg_img, focal, princpt, tag_prefix, text_prompts=None):
-        try:
-            # Validate pose shape (unchanged)
-            if poses.dim() == 2:
-                print(f"🔍 Pose shape: {poses.shape}, POSE_DIM: {self.POSE_DIM}, Joints: {poses.shape[-1]/self.POSE_DIM}")
-                batch_size, pose_dim = poses.shape
-                if pose_dim != 63:
-                    print(f"⚠️ Pose dim mismatch: expected 63, got {pose_dim} — truncating/padding!")
-                    if pose_dim > 63:
-                        poses = poses[:, :63]
-                    else:
-                        poses = torch.cat([poses, torch.zeros(batch_size, 63 - pose_dim, device=poses.device)], dim=-1)
-            
-            # Generate SMPL-X meshes (unchanged)
-            body_out = self.body_model_vis(body_pose=poses)
-            meshes = body_out.v.detach().cpu().numpy()
-            faces = body_out.f.cpu().numpy()
-
-            # Render each mesh + overlay text prompts
-            rendered_images = []
-            for idx, mesh in enumerate(meshes):
-                rendered_img = render_mesh(bg_img, mesh, faces, {'focal': focal, 'princpt': princpt})
-                if rendered_img is None:
-                    rendered_img = np.ones_like(bg_img) * 255
-
-                # --------------------------
-                # Overlay text (no "Prompt" label)
-                # --------------------------
-                if text_prompts is not None:
-                    # Common setup: split prompt into 2 lines (30 chars each)
-                    sample_idx = idx // 10  # 0-4 for 5 samples
-                    if sample_idx < len(text_prompts):
-                        prompt = text_prompts[sample_idx]
-                        # Split into 2 lines (30 chars per line, no truncation ellipsis)
-                        line1 = prompt[:53]
-                        line2 = prompt[53:106] if len(prompt) > 53 else ""
-                        
-                        # Font config (smaller for 2 lines)
-                        font_size = 0.4
-                        font_thickness_outline = 2
-                        font_thickness_text = 1
-                        text_color_outline = (0, 0, 0)  # Black
-                        text_color = (255, 255, 255)    # White
-
-                        # --------------------------
-                        # For trajs_grid: 2 lines prompt + 1 line step
-                        # --------------------------
-                        if tag_prefix == 'trajs':
-                            step_idx = idx % 10  # 0-9 for 10 steps
-                            
-                            # Line 1 of prompt (top)
-                            cv2.putText(
-                                rendered_img,
-                                line1,
-                                (10, 25),  # Position (x, y)
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color_outline,
-                                font_thickness_outline,
-                                cv2.LINE_AA
-                            )
-                            cv2.putText(
-                                rendered_img,
-                                line1,
-                                (10, 25),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color,
-                                font_thickness_text,
-                                cv2.LINE_AA
-                            )
-                            
-                            # Line 2 of prompt (middle)
-                            if line2:
-                                cv2.putText(
-                                    rendered_img,
-                                    line2,
-                                    (10, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    font_size,
-                                    text_color_outline,
-                                    font_thickness_outline,
-                                    cv2.LINE_AA
-                                )
-                                cv2.putText(
-                                    rendered_img,
-                                    line2,
-                                    (10, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    font_size,
-                                    text_color,
-                                    font_thickness_text,
-                                    cv2.LINE_AA
-                                )
-                            
-                            # Step number (3rd line, bottom)
-                            cv2.putText(
-                                rendered_img,
-                                f"Step: {step_idx+1}/10",
-                                (10, 75),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color_outline,
-                                font_thickness_outline,
-                                cv2.LINE_AA
-                            )
-                            cv2.putText(
-                                rendered_img,
-                                f"Step: {step_idx+1}/10",
-                                (10, 75),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color,
-                                font_thickness_text,
-                                cv2.LINE_AA
-                            )
-
-                        # --------------------------
-                        # For samples_grid: only 2 lines prompt (no step)
-                        # --------------------------
-                        elif tag_prefix == 'samples':
-                            # Line 1 of prompt
-                            cv2.putText(
-                                rendered_img,
-                                line1,
-                                (10, 25),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color_outline,
-                                font_thickness_outline,
-                                cv2.LINE_AA
-                            )
-                            cv2.putText(
-                                rendered_img,
-                                line1,
-                                (10, 25),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                font_size,
-                                text_color,
-                                font_thickness_text,
-                                cv2.LINE_AA
-                            )
-                            
-                            # Line 2 of prompt
-                            if line2:
-                                cv2.putText(
-                                    rendered_img,
-                                    line2,
-                                    (10, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    font_size,
-                                    text_color_outline,
-                                    font_thickness_outline,
-                                    cv2.LINE_AA
-                                )
-                                cv2.putText(
-                                    rendered_img,
-                                    line2,
-                                    (10, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    font_size,
-                                    text_color,
-                                    font_thickness_text,
-                                    cv2.LINE_AA
-                                )
-
-                # Convert to tensor (unchanged)
-                rendered_img_tensor = self.convert_to_tensor(rendered_img)
-                rendered_images.append(rendered_img_tensor)
-
-            # Rest of the function (create grid, save, return) — unchanged
-            image_grid = torchvision.utils.make_grid(rendered_images, nrow=10)
-            self.logger.experiment.add_image(f'{tag_prefix}_grid', image_grid, self.current_epoch)
-            
-            image_grid_np = image_grid.permute(1, 2, 0).cpu().numpy()
-            image_grid_np = (image_grid_np * 255).astype(np.uint8)
-
-            os.makedirs(f"logs/renders/step_{self.global_step}", exist_ok=True)
-            cv2.imwrite(f"logs/renders/step_{self.global_step}/{tag_prefix}_grid.png", image_grid_np[:, :, ::-1])
-            print(f"✅ Saved {tag_prefix}_grid.png to logs/renders/step_{self.global_step}/")
-
-            return image_grid_np
-
-        except Exception as e:
-            print(f"❌ process_and_log_meshes failed for {tag_prefix}: {e}")
-            import traceback
-            traceback.print_exc()
-            dummy_img = np.ones((512, 384, 3), dtype=np.uint8) * 255
-            return dummy_img
-
-    # def convert_to_tensor(self, img):
-    #     # Convert the image to a PyTorch tensor and normalize it to [0, 1]
-    #     img_tensor = torch.from_numpy(img).float() / 255.0
-    #     return img_tensor
-
-    # The original function returns [H, W, 3], but TensorBoard requires [C, H, W].
-    def convert_to_tensor(self, img):
-        """
-        img: numpy array [H, W, 3] or [H, W]
-        returns: torch tensor [C, H, W] in [0, 1]
-        """
-        img = img.astype(np.float32)
-        # Normalize only if image is 0–255
-        if img.max() > 1.0:
-            img = img / 255.0
-
-        img_tensor = torch.from_numpy(img)
-        img_tensor = img_tensor.permute(2, 0, 1)
-
-        return img_tensor 
 
     def configure_optimizers(self):
         # Set up the optimizer
@@ -743,7 +512,9 @@ def main(args, config, try_resume):
         raise ValueError("Validation DataLoader is empty! Check dataset path/version.")
     model = DPoserTrainer(config, args.bodymodel_path, data_path, N_POSES,
                           train_loader=data_module.train_dataloader(),
-                          val_loader=val_loader)  
+                          val_loader=val_loader,
+                          pretrained_ckpt=args.pretrained_ckpt,
+                          freeze_pretrained=args.freeze_pretrained)  
     # model = DPoserTrainer(config, args.bodymodel_path, data_path, N_POSES,
     #                       train_loader=data_module.train_dataloader(),
     #                       val_loader=data_module.val_dataloader(), )
