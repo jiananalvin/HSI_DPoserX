@@ -188,7 +188,7 @@ class DPoserTrainer(pl.LightningModule):
     def setup_step_fn(self, config):
         # Build one-step training and evaluation functions
         # NOTE: For text-to-pose training, auxiliary_loss=True is recommended to enable
-        # reconstruction loss (recon_mse/recon_mpjpe) which helps the model learn
+        # reconstruction loss (recon_param_mse/recon_joint_l2) which helps the model learn
         # to reconstruct poses from text embeddings.
         kwargs = {}
         if config.training.auxiliary_loss:
@@ -298,7 +298,7 @@ class DPoserTrainer(pl.LightningModule):
         text_list = batch['caption']  # Get raw text prompts (not embeddings)
         text_embeds_val = self.encode_text(text_list)
         
-        # 🔴 Step 1: Compute reconstruction loss (recon_mse/recon_mpjpe)
+        # 🔴 Step 1: Compute reconstruction loss (recon_param_mse/recon_joint_l2)
         with torch.no_grad():  # Ensure no gradients (validation)
             loss_dict = self.val_step_fn(self.model, batch=poses, condition=text_embeds_val, mask=None)
         
@@ -316,14 +316,18 @@ class DPoserTrainer(pl.LightningModule):
             self.last_text_prompts = text_list[:5] if (trajs is not None and len(text_list)>=5) else []
 
         # --------------------------
-        # 🔴 Step 2: Add reconstruction metrics to eval_metrics
-        # Note: recon_mse and recon_mpjpe are only computed when auxiliary_loss=True
+        # 🔴 Step 2: Add all loss terms to eval_metrics (consistent naming with training)
+        # All loss terms are now always present in loss_dict (set to 0.0 when not used)
         # --------------------------
-        recon_mse_val = loss_dict.get('recon_mse', torch.tensor(0.0))
-        recon_mpjpe_val = loss_dict.get('recon_mpjpe', torch.tensor(0.0))
-        eval_metrics['recon_mse'] = recon_mse_val.item() if isinstance(recon_mse_val, torch.Tensor) else recon_mse_val
-        eval_metrics['recon_mpjpe'] = recon_mpjpe_val.item() if isinstance(recon_mpjpe_val, torch.Tensor) else recon_mpjpe_val
-        eval_metrics['score_loss'] = loss_dict['score_loss'].item()  # Optional: pure diffusion loss
+        def to_scalar(v):
+            return v.item() if isinstance(v, torch.Tensor) else v
+        
+        eval_metrics['loss'] = to_scalar(loss_dict.get('loss', torch.tensor(0.0)))
+        eval_metrics['diffusion_loss'] = to_scalar(loss_dict.get('diffusion_loss', torch.tensor(0.0)))
+        eval_metrics['v2v_loss'] = to_scalar(loss_dict.get('v2v_loss', torch.tensor(0.0)))
+        eval_metrics['j2j_loss'] = to_scalar(loss_dict.get('j2j_loss', torch.tensor(0.0)))
+        eval_metrics['recon_param_mse'] = to_scalar(loss_dict.get('recon_param_mse', torch.tensor(0.0)))
+        eval_metrics['recon_joint_l2'] = to_scalar(loss_dict.get('recon_joint_l2', torch.tensor(0.0)))
 
         # --------------------------
         # logging
@@ -336,28 +340,21 @@ class DPoserTrainer(pl.LightningModule):
                 sync_dist=True, 
                 logger=True,
                 batch_size=poses.shape[0],  # Critical for epoch averaging
-                prog_bar=(metric_name in ['recon_mse', 'mpjpe'])  # Show recon_mse in progress bar
+                prog_bar=(metric_name in ['recon_param_mse', 'mpjpe'])  # Show reconstruction metrics in progress bar
             )
         
-        # 🔴 Step 3: Explicitly log reconstruction metrics (for clear curves)
-        # Only log if reconstruction metrics were actually computed (auxiliary_loss=True)
-        if 'recon_mse' in loss_dict and loss_dict['recon_mse'] != 0.0:
-            self.log(
-                'val_recon_mse', 
-                loss_dict['recon_mse'], 
-                sync_dist=True, 
-                logger=True,
-                batch_size=poses.shape[0],
-                prog_bar=True  # Show in progress bar for real-time monitoring
-            )
-        if 'recon_mpjpe' in loss_dict and loss_dict['recon_mpjpe'] != 0.0:
-            self.log(
-                'val_recon_mpjpe', 
-                loss_dict['recon_mpjpe'], 
-                sync_dist=True, 
-                logger=True,
-                batch_size=poses.shape[0]
-            )
+        # 🔴 Step 3: Explicitly log all loss terms (for clear curves)
+        # All loss terms are now always present in loss_dict (consistent with training)
+        for loss_name in ['loss', 'diffusion_loss', 'v2v_loss', 'j2j_loss', 'recon_param_mse', 'recon_joint_l2']:
+            if loss_name in loss_dict:
+                self.log(
+                    f'val_{loss_name}', 
+                    loss_dict[loss_name], 
+                    sync_dist=True, 
+                    logger=True,
+                    batch_size=poses.shape[0],
+                    prog_bar=(loss_name in ['recon_param_mse', 'recon_joint_l2'])  # Show reconstruction metrics in progress bar
+                )
         
         return eval_metrics
 
@@ -367,20 +364,20 @@ class DPoserTrainer(pl.LightningModule):
         self.model_ema.restore(self.model.parameters())
         
         # 🔴 Step 1: Calculate epoch-averaged reconstruction metrics
-        val_recon_mse = self.trainer.callback_metrics.get('val_recon_mse', torch.tensor(0.0))
-        val_recon_mpjpe = self.trainer.callback_metrics.get('val_recon_mpjpe', torch.tensor(0.0))
+        val_recon_param_mse = self.trainer.callback_metrics.get('val_recon_param_mse', torch.tensor(0.0))
+        val_recon_joint_l2 = self.trainer.callback_metrics.get('val_recon_joint_l2', torch.tensor(0.0))
         
         # Log epoch-averaged values (clean curve)
         self.log(
-            'val_recon_mse_epoch', 
-            val_recon_mse, 
+            'val_recon_param_mse_epoch', 
+            val_recon_param_mse, 
             sync_dist=True, 
             logger=True,
             prog_bar=True
         )
         self.log(
-            'val_recon_mpjpe_epoch', 
-            val_recon_mpjpe, 
+            'val_recon_joint_l2_epoch', 
+            val_recon_joint_l2, 
             sync_dist=True, 
             logger=True
         )

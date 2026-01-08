@@ -116,8 +116,8 @@ def get_sde_loss_fn(sde, train, reduce_mean=False, continuous=True, likelihood_w
         perturbed_data = mean + std[:, None] * z
 
         # Initialize reconstruction loss variables (safe defaults)
-        recon_mse = torch.tensor(0.0, device=batch.device)
-        recon_mpjpe = torch.tensor(0.0, device=batch.device)
+        recon_param_mse = torch.tensor(0.0, device=batch.device)
+        recon_joint_l2 = torch.tensor(0.0, device=batch.device)
         estimated_data = perturbed_data.clone()
         SNR = torch.ones(batch.shape[0], 1, device=batch.device)
 
@@ -136,17 +136,20 @@ def get_sde_loss_fn(sde, train, reduce_mean=False, continuous=True, likelihood_w
                 score = score_fn(perturbed_data, t, condition=condition, mask=mask)
                 estimated_data = perturbed_data.clone()
             
-            # 🔴 YOUR SUPERVISOR'S RECONSTRUCTION LOSS (MSE + MPJPE)
-            # 1. MSE loss (denoised sample vs original batch)
-            recon_mse = torch.mean(torch.square(estimated_data - batch) * loss_mask)
+            # 🔴 YOUR SUPERVISOR'S RECONSTRUCTION LOSS (MSE + per-joint L2)
+            # 1. Element-wise MSE: treats each dimension independently
+            #    Formula: mean((estimated - original)²) across all dimensions
+            recon_param_mse = torch.mean(torch.square(estimated_data - batch) * loss_mask)
             
-            # 2. MPJPE loss (per-joint position error)
+            # 2. Per-joint L2 distance: groups by joint, computes Euclidean distance per joint
+            #    Formula: mean(||estimated_joint - original_joint||) for each joint
+            #    Note: This is in pose parameter space (axis-angle), NOT 3D joint positions
             if batch.shape[1] == 63:  # 21 joints × 3 dims
-                batch_joints = batch.reshape(-1, 21, 3)
-                estimated_joints = estimated_data.reshape(-1, 21, 3)
-                mpjpe_per_joint = torch.norm(estimated_joints - batch_joints, dim=-1)
+                batch_pose = batch.reshape(-1, 21, 3)              # Pose params [B, 21, 3]
+                estimated_pose = estimated_data.reshape(-1, 21, 3)  # Pose params [B, 21, 3]
+                joint_l2_per_joint = torch.norm(estimated_pose - batch_pose, dim=-1)  # L2 per joint
                 mask_expanded = loss_mask.squeeze(1).unsqueeze(1)
-                recon_mpjpe = torch.mean(mpjpe_per_joint * mask_expanded)
+                recon_joint_l2 = torch.mean(joint_l2_per_joint * mask_expanded)
         else:
             score = score_fn(perturbed_data, t, condition=condition, mask=mask)
 
@@ -159,19 +162,26 @@ def get_sde_loss_fn(sde, train, reduce_mean=False, continuous=True, likelihood_w
             losses = torch.square(score + z / std[:, None]) * loss_mask
             losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1) * g2
 
-        # 🔴 Combine diffusion loss + reconstruction loss (adjust weights as needed)
-        loss = torch.mean(losses) + 0.1 * recon_mse + 0.1 * recon_mpjpe
+        # Core diffusion loss (score matching loss, without reconstruction losses)
+        diffusion_loss = torch.mean(losses)
+        
+        # Note: recon_param_mse and recon_joint_l2 are computed for logging only
+        # They are NOT used for backpropagation (removed from loss calculation)
 
         if return_data:
-            return loss, {
+            # When auxiliary_loss=True: return pure diffusion loss (recon losses NOT in backprop)
+            # Recon losses are still computed and returned for logging only
+            return diffusion_loss, {
                 'clean_sample': estimated_data,
                 'SNR': SNR,
                 't': t,
-                'recon_mse': recon_mse,
-                'recon_mpjpe': recon_mpjpe
+                'recon_param_mse': recon_param_mse,   # Element-wise MSE in pose space (for logging only)
+                'recon_joint_l2': recon_joint_l2      # Per-joint L2 distance in pose space (for logging only)
             }
         else:
-            return loss
+            # When auxiliary_loss=False: return pure diffusion loss (recon losses NOT in backprop)
+            # Note: recon losses are NOT computed when return_data=False (can't log them in this case)
+            return diffusion_loss
 
     return loss_fn
 
@@ -256,56 +266,78 @@ def get_step_fn(sde, train, optimize_fn=None,
         """One-step training/eval with reconstruction loss."""
         if train:
             if not auxiliary_loss:
-                # Basic diffusion + reconstruction loss
+                # Basic diffusion loss only (recon losses NOT used for backprop)
+                # Note: recon losses are not computed when auxiliary_loss=False (return_data=False)
                 total_loss = loss_fn(model, batch, condition, mask)
+                # total_loss is now pure diffusion_loss (recon losses not included)
                 loss_dict = {
                     'loss': total_loss,
-                    'score_loss': total_loss,
-                    'recon_mse': torch.tensor(0.0),  # Placeholder (filled by loss_fn)
-                    'recon_mpjpe': torch.tensor(0.0)  # TODO
+                    'diffusion_loss': total_loss,  # Pure diffusion loss (no recon losses)
+                    'recon_param_mse': torch.tensor(0.0, device=total_loss.device),  # Not computed when auxiliary_loss=False
+                    'recon_joint_l2': torch.tensor(0.0, device=total_loss.device)    # Not computed when auxiliary_loss=False
                 }
             else:
-                # Auxiliary loss + reconstruction
-                score_loss, data_dict = loss_fn(model, batch, condition, mask)
+                # Auxiliary loss: recon losses NOT used for backprop, only v2v/j2j are used
+                # Recon losses are still computed for logging/monitoring
+                diffusion_loss, data_dict = loss_fn(model, batch, condition, mask)
+                # diffusion_loss is PURE diffusion score matching loss (no recon losses included)
+                
                 weight = torch.log(1.0 + data_dict['SNR'])
                 estimate = denormalize(data_dict['clean_sample'], to_axis=True)
                 batch_denorm = denormalize(batch, to_axis=True)
                 
-                # Auxiliary v2v/j2j loss (unchanged)
+                # Auxiliary v2v/j2j loss (these ARE used for backprop)
+                # Convert positions to mm and compute loss (naturally gives mm²)
                 gt_body = body_model(**{param: batch_denorm})
                 pred_body = body_model(**{param: estimate})
-                loss_v2v = torch.mean(weight * l2_loss(gt_body.v, pred_body.v).sum(dim=-1))
-                loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr, pred_body.Jtr).sum(dim=-1))
+                loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))  # * 1000 convert m to mm
+                loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
                 
-                # Total loss (diffusion + auxiliary + reconstruction)
-                total_loss = score_loss + loss_v2v + loss_j2j
+                # Total loss: ONLY diffusion + v2v + j2j (recon losses NOT included)
+                # All losses now in consistent units: diffusion_loss (dimensionless) + v2v/j2j (mm²)
+                total_loss = diffusion_loss + loss_v2v + loss_j2j
                 
                 loss_dict = {
-                    'loss': total_loss,
-                    'score_loss': score_loss,
-                    'v2v_loss': loss_v2v,
-                    'j2j_loss': loss_j2j,
-                    'recon_mse': data_dict['recon_mse'],  # From your reconstruction loss
-                    'recon_mpjpe': data_dict['recon_mpjpe']  # From your reconstruction loss
+                    'loss': total_loss,  # Used for backprop (v2v/j2j in mm²)
+                    'diffusion_loss': diffusion_loss,  # Dimensionless (score matching loss)
+                    'v2v_loss': loss_v2v,  # Already in mm² (computed on mm-scale positions)
+                    'j2j_loss': loss_j2j,  # Already in mm² (computed on mm-scale positions)
+                    'recon_param_mse': data_dict['recon_param_mse'],  # Dimensionless (for logging only)
+                    'recon_joint_l2': data_dict['recon_joint_l2']     # In pose space (for logging only)
                 }
         else:
             # Validation (no gradient)
             with torch.no_grad():
                 if auxiliary_loss:
-                    score_loss, data_dict = loss_fn(model, batch, condition, mask)
+                    diffusion_loss, data_dict = loss_fn(model, batch, condition, mask)
+                    # Compute v2v/j2j losses for monitoring (same as training, but no backprop)
+                    # Convert positions to mm for consistency with training
+                    weight = torch.log(1.0 + data_dict['SNR'])
+                    estimate = denormalize(data_dict['clean_sample'], to_axis=True)
+                    batch_denorm = denormalize(batch, to_axis=True)
+                    
+                    gt_body = body_model(**{param: batch_denorm})
+                    pred_body = body_model(**{param: estimate})
+                    loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))
+                    loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
+                    
                     loss_dict = {
-                        'loss': score_loss,
-                        'score_loss': score_loss,
-                        'recon_mse': data_dict['recon_mse'],
-                        'recon_mpjpe': data_dict['recon_mpjpe']
+                        'loss': diffusion_loss,
+                        'diffusion_loss': diffusion_loss,  # Dimensionless
+                        'v2v_loss': loss_v2v,  # Already in mm² (computed on mm-scale positions)
+                        'j2j_loss': loss_j2j,  # Already in mm² (computed on mm-scale positions)
+                        'recon_param_mse': data_dict['recon_param_mse'],  # Dimensionless
+                        'recon_joint_l2': data_dict['recon_joint_l2']  # In pose space (for logging only)
                     }
                 else:
                     total_loss = loss_fn(model, batch, condition, mask)
                     loss_dict = {
                         'loss': total_loss,
-                        'score_loss': total_loss,
-                        'recon_mse': torch.tensor(0.0),
-                        'recon_mpjpe': torch.tensor(0.0)
+                        'diffusion_loss': total_loss,
+                        'v2v_loss': torch.tensor(0.0, device=total_loss.device),
+                        'j2j_loss': torch.tensor(0.0, device=total_loss.device),
+                        'recon_param_mse': torch.tensor(0.0, device=total_loss.device),
+                        'recon_joint_l2': torch.tensor(0.0, device=total_loss.device)
                     }
         return loss_dict
 

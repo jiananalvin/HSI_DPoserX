@@ -8,14 +8,11 @@ from functools import partial
 from types import SimpleNamespace
 from pathlib import Path
 
-import cv2
+import argparse
 import numpy as np
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-from absl import flags, app
-from absl.flags import argparse_flags
-from ml_collections.config_flags import config_flags
 
 # Import your core modules (now works with PYTHONPATH fix)
 from lib.algorithms.advanced import likelihood, sde_lib, sampling
@@ -23,7 +20,7 @@ from lib.algorithms.advanced.model import create_model
 from lib.body_model.body_model import BodyModel
 from lib.body_model.visual import render_mesh, multiple_render
 from lib.dataset.body.AMASS import AMASSDataset
-from lib.utils.generic import load_model
+from lib.utils.generic import load_model, import_configs
 from lib.dataset.utils import Posenormalizer
 
 # OpenCLIP for text encoding
@@ -98,13 +95,6 @@ class AMASSDataModule(pl.LightningDataModule):
         )
 
 
-# --------------------------
-# Configure Flags
-# --------------------------
-FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", None, "Inference configuration.", lock_config=False)
-flags.mark_flags_as_required(["config"])
-
 # Render settings
 bg_img = np.ones([512, 384, 3]) * 255  # background canvas
 focal = [1500, 1500]
@@ -115,7 +105,11 @@ princpt = [200, 192]
 # Parse Args
 # --------------------------
 def parse_args(argv):
-    parser = argparse_flags.ArgumentParser(description='Text-conditioned pose generation on test set')
+    parser = argparse.ArgumentParser(description='Text-conditioned pose generation on test set')
+    
+    parser.add_argument('--config-path', '-c', type=str,
+                        default='configs.body.subvp.timefc.get_config',
+                        help='config files to build DPoser')
 
     parser.add_argument('--data-root', type=str, default='./data/body_data')
     parser.add_argument('--version', type=str, default='version1')
@@ -134,7 +128,8 @@ def parse_args(argv):
     parser.add_argument('--max-test-samples', type=int, default=100)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 
-    parser.add_argument('--output-path', type=str, default='./output/body/test_inference')
+    parser.add_argument('--output-path', type=str, default=None, 
+                        help='Output directory. If not provided, will be derived from checkpoint path.')
 
     # keep this arg for compatibility, but we will IGNORE it and force faster=False
     parser.add_argument('--faster-render', action='store_true', default=True)
@@ -142,6 +137,26 @@ def parse_args(argv):
     parser.add_argument('--view', type=str, default='front')
 
     args = parser.parse_args(argv[1:])
+    
+    # Auto-derive output path from checkpoint path if not provided
+    if args.output_path is None:
+        # Extract experiment name from checkpoint path
+        # Expected format: checkpoints/dposer/{dataset}/{name}/last.ckpt
+        ckpt_path = args.ckpt_path
+        # Normalize path separators and remove trailing slashes
+        ckpt_path = ckpt_path.replace('\\', '/').rstrip('/')
+        # Extract the folder name (second-to-last component before filename)
+        path_parts = [p for p in ckpt_path.split('/') if p]  # Remove empty parts
+        if len(path_parts) >= 2:
+            # Get the folder name (e.g., 'fintuneondposerx_2026_01_01' from 'checkpoints/dposer/amass/fintuneondposerx_2026_01_01/last.ckpt')
+            experiment_name = path_parts[-2]  # Second-to-last part
+            args.output_path = f'./output/body/{experiment_name}'
+            print(f"📁 Auto-derived output path from checkpoint: {args.output_path}")
+        else:
+            # Fallback if path structure is unexpected
+            args.output_path = './output/body/test_inference'
+            print(f"⚠️  Could not derive output path from checkpoint, using default: {args.output_path}")
+    
     return args
 
 
@@ -167,6 +182,9 @@ class TextConditionedInferencer:
         # SDE
         self.sde = self._setup_sde()
         self.sampling_eps = 1e-3 if self.config.training.sde.lower() in ['vpsde', 'subvpsde'] else 1e-5
+
+        # Text embedding dimension (must be set before model creation)
+        self.text_embedding_dim = 768  # Must match training
 
         # Model
         self.pose_dim = 3 if config.data.rot_rep == 'axis' else 6
@@ -235,7 +253,7 @@ class TextConditionedInferencer:
             raise NotImplementedError(f"SDE {self.config.training.sde} not supported")
 
     def _setup_model(self):
-        model = create_model(self.config.model, N_POSES, self.pose_dim)
+        model = create_model(self.config.model, N_POSES, self.pose_dim, text_embedding_dim=self.text_embedding_dim)
         model = model.to(self.device)
         model.eval()
         load_model(model, self.config.model, self.args.ckpt_path, self.device, is_ema=True)
@@ -323,12 +341,11 @@ class TextConditionedInferencer:
 # --------------------------
 # Main
 # --------------------------
-def main(args):
+def main(args, config):
     torch.manual_seed(42)
     np.random.seed(42)
     torch.set_grad_enabled(False)
 
-    config = FLAGS.config
     inferencer = TextConditionedInferencer(args, config)
 
     print("\n📥 Loading PoseScript test set...")
@@ -375,4 +392,6 @@ def main(args):
 
 
 if __name__ == '__main__':
-    app.run(main, flags_parser=parse_args)
+    args = parse_args(sys.argv)
+    config = import_configs(args.config_path)
+    main(args, config)

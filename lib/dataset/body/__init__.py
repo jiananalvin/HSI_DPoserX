@@ -86,16 +86,15 @@ class Evaler:
         body_out = self.body_model(body_pose=outs)
 
         for n in range(sample_num):
-            # MPVPE from all vertices
-            mesh_gt = body_gt.v.detach().cpu().numpy()[n, self.vert_idx]
-            mesh_out = body_out.v.detach().cpu().numpy()[n, self.vert_idx]
-            eval_result['mpvpe'].append(np.sqrt(np.sum((mesh_out - mesh_gt) ** 2, 1)).mean() * 1000)
+            # MPVPE from all vertices (convert to mm inline)
+            mesh_gt = body_gt.v.detach().cpu().numpy()[n, self.vert_idx] * 1000
+            mesh_out = body_out.v.detach().cpu().numpy()[n, self.vert_idx] * 1000
+            eval_result['mpvpe'].append(np.sqrt(np.sum((mesh_out - mesh_gt) ** 2, 1)).mean())
 
-            joint_gt_body = body_gt.Jtr.detach().cpu().numpy()[n, self.joint_idx]
-            joint_out_body = body_out.Jtr.detach().cpu().numpy()[n, self.joint_idx]
-
-            eval_result['mpjpe'].append(
-                np.sqrt(np.sum((joint_out_body - joint_gt_body) ** 2, 1)).mean() * 1000)
+            # MPJPE from joints (convert to mm inline)
+            joint_gt = body_gt.Jtr.detach().cpu().numpy()[n, self.joint_idx] * 1000
+            joint_out = body_out.Jtr.detach().cpu().numpy()[n, self.joint_idx] * 1000
+            eval_result['mpjpe'].append(np.sqrt(np.sum((joint_out - joint_gt) ** 2, 1)).mean())
 
         return eval_result
 
