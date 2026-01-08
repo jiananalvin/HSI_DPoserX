@@ -324,8 +324,7 @@ class DPoserTrainer(pl.LightningModule):
         
         eval_metrics['loss'] = to_scalar(loss_dict.get('loss', torch.tensor(0.0)))
         eval_metrics['diffusion_loss'] = to_scalar(loss_dict.get('diffusion_loss', torch.tensor(0.0)))
-        eval_metrics['v2v_loss'] = to_scalar(loss_dict.get('v2v_loss', torch.tensor(0.0)))
-        eval_metrics['j2j_loss'] = to_scalar(loss_dict.get('j2j_loss', torch.tensor(0.0)))
+        # Note: v2v_loss and j2j_loss not logged in validation - MPVPE and MPJPE are logged instead
         eval_metrics['recon_param_mse'] = to_scalar(loss_dict.get('recon_param_mse', torch.tensor(0.0)))
         eval_metrics['recon_joint_l2'] = to_scalar(loss_dict.get('recon_joint_l2', torch.tensor(0.0)))
 
@@ -342,19 +341,6 @@ class DPoserTrainer(pl.LightningModule):
                 batch_size=poses.shape[0],  # Critical for epoch averaging
                 prog_bar=(metric_name in ['recon_param_mse', 'mpjpe'])  # Show reconstruction metrics in progress bar
             )
-        
-        # 🔴 Step 3: Explicitly log all loss terms (for clear curves)
-        # All loss terms are now always present in loss_dict (consistent with training)
-        for loss_name in ['loss', 'diffusion_loss', 'v2v_loss', 'j2j_loss', 'recon_param_mse', 'recon_joint_l2']:
-            if loss_name in loss_dict:
-                self.log(
-                    f'val_{loss_name}', 
-                    loss_dict[loss_name], 
-                    sync_dist=True, 
-                    logger=True,
-                    batch_size=poses.shape[0],
-                    prog_bar=(loss_name in ['recon_param_mse', 'recon_joint_l2'])  # Show reconstruction metrics in progress bar
-                )
         
         return eval_metrics
 

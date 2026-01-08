@@ -310,32 +310,18 @@ def get_step_fn(sde, train, optimize_fn=None,
             with torch.no_grad():
                 if auxiliary_loss:
                     diffusion_loss, data_dict = loss_fn(model, batch, condition, mask)
-                    # Compute v2v/j2j losses for monitoring (same as training, but no backprop)
-                    # Convert positions to mm for consistency with training
-                    weight = torch.log(1.0 + data_dict['SNR'])
-                    estimate = denormalize(data_dict['clean_sample'], to_axis=True)
-                    batch_denorm = denormalize(batch, to_axis=True)
-                    
-                    gt_body = body_model(**{param: batch_denorm})
-                    pred_body = body_model(**{param: estimate})
-                    loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))
-                    loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
-                    
+                    # Note: v2v_loss and j2j_loss not computed here - validation logs MPVPE and MPJPE instead
                     loss_dict = {
                         'loss': diffusion_loss,
-                        'diffusion_loss': diffusion_loss,  # Dimensionless
-                        'v2v_loss': loss_v2v,  # Already in mm² (computed on mm-scale positions)
-                        'j2j_loss': loss_j2j,  # Already in mm² (computed on mm-scale positions)
-                        'recon_param_mse': data_dict['recon_param_mse'],  # Dimensionless
-                        'recon_joint_l2': data_dict['recon_joint_l2']  # In pose space (for logging only)
+                        'diffusion_loss': diffusion_loss,
+                        'recon_param_mse': data_dict['recon_param_mse'],
+                        'recon_joint_l2': data_dict['recon_joint_l2']
                     }
                 else:
                     total_loss = loss_fn(model, batch, condition, mask)
                     loss_dict = {
                         'loss': total_loss,
                         'diffusion_loss': total_loss,
-                        'v2v_loss': torch.tensor(0.0, device=total_loss.device),
-                        'j2j_loss': torch.tensor(0.0, device=total_loss.device),
                         'recon_param_mse': torch.tensor(0.0, device=total_loss.device),
                         'recon_joint_l2': torch.tensor(0.0, device=total_loss.device)
                     }
