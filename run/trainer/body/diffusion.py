@@ -30,6 +30,7 @@ import open_clip
 import wandb
 from lib.utils.wandb_helpers import init_wandb, log_dict_to_wandb
 from lib.utils.training_visualization import render_and_log_images
+from lib.utils.text_encoders import create_text_encoder, RECOMMENDED_ENCODERS
 from lib.utils.checkpoint_utils import load_pretrained_checkpoint_for_finetuning, set_requires_grad_for_text_conditioning_only
 
 def parse_args(argv):
@@ -74,14 +75,31 @@ class DPoserTrainer(pl.LightningModule):
         self.freeze_pretrained = freeze_pretrained
         self.save_hyperparameters(ignore=['train_loader', 'val_loader'])
 
-        # CLIP
-        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
-            "ViT-L-14", pretrained="openai"
-        )
-        self.clip_tokenizer = open_clip.get_tokenizer("ViT-L-14")
-        for p in self.clip_model.parameters():
-            p.requires_grad = False
-        self.text_embedding_dim = 768
+        # Text Encoder - configurable via config or default to CLIP for backward compatibility
+        text_encoder_config = getattr(config, 'text_encoder', None)
+        if text_encoder_config is not None:
+            encoder_type = getattr(text_encoder_config, 'type', 'clip')
+            encoder_model = getattr(text_encoder_config, 'model_name', None)
+        else:
+            encoder_type = 'clip'
+            encoder_model = None
+        
+        # Create text encoder (will be initialized in setup() when device is available)
+        self.text_encoder = None  # Will be initialized in setup() when device is available
+        self.text_encoder_type = encoder_type
+        self.text_encoder_model = encoder_model
+        
+        # Get embedding dimension based on encoder type and model
+        # Handle special cases for model-specific dimensions
+        if encoder_type == 'sentence-bert' and encoder_model == 'all-MiniLM-L6-v2':
+            self.text_embedding_dim = 384
+        elif encoder_type == 't5' and encoder_model == 't5-small':
+            self.text_embedding_dim = 512
+        elif encoder_type in RECOMMENDED_ENCODERS:
+            _, _, self.text_embedding_dim = RECOMMENDED_ENCODERS[encoder_type]
+        else:
+            # Default to CLIP dimensions for backward compatibility
+            self.text_embedding_dim = 768
 
         # Collect data
         self.last_trajs = None
@@ -127,12 +145,10 @@ class DPoserTrainer(pl.LightningModule):
     
     @torch.no_grad()
     def encode_text(self, text_list):
-        text_tokens = self.clip_tokenizer([text.strip().lower() for text in text_list]).to(self.device)
-        text_embeds = self.clip_model.encode_text(text_tokens)
-        # Normalize embeddings (critical for CLIP alignment)
-        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        
-        return text_embeds
+        """Encode text using the configured text encoder."""
+        if self.text_encoder is None:
+            raise RuntimeError("Text encoder not initialized. Call setup() first.")
+        return self.text_encoder.encode(text_list)
 
     def train_dataloader(self):
         return self.train_loader
@@ -142,7 +158,26 @@ class DPoserTrainer(pl.LightningModule):
 
     def setup(self, stage=None):
         if stage == 'fit':
-            self.clip_model = self.clip_model.to(self.device)
+            # Initialize text encoder (needs device to be set)
+            if self.text_encoder is None:
+                print(f"📝 Initializing text encoder: {self.text_encoder_type}")
+                if self.text_encoder_model:
+                    print(f"   Model: {self.text_encoder_model}")
+                self.text_encoder = create_text_encoder(
+                    encoder_type=self.text_encoder_type,
+                    model_name=self.text_encoder_model,
+                    device=self.device
+                )
+                self.text_embedding_dim = self.text_encoder.embedding_dim
+                print(f"   Embedding dimension: {self.text_embedding_dim}")
+                print(f"   Max text length: {self.text_encoder.max_length} tokens")
+                
+                # Update model with correct text embedding dimension if needed
+                # (Only if embedding dim changed from default 768)
+                if self.text_embedding_dim != 768:
+                    print(f"⚠️  Warning: Text embedding dim is {self.text_embedding_dim}, not 768.")
+                    print(f"   Make sure your model was initialized with text_embedding_dim={self.text_embedding_dim}")
+            
             self.body_model_vis = self.body_model_vis.to(self.device)
             self.body_model_eval = self.body_model_eval.to(self.device)
             self.model_ema = ExponentialMovingAverage(self.model.parameters(),

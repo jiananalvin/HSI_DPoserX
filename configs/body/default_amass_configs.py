@@ -1,4 +1,5 @@
 from configs.general_configs import get_general_configs
+import ml_collections
 
 
 def get_default_configs():
@@ -21,7 +22,7 @@ def get_default_configs():
     training.log_freq = 100   # Log every 100 iterations 
     training.eval_freq = 300  # 10000
     training.save_freq = 450  # 15000
-    training.auxiliary_loss = True  # not recommended
+    training.auxiliary_loss = False  # not recommended
     training.denoise_steps = 10  # for computing auxiliary loss
     training.render = True  # render results while validating
     training.likelihood_weighting = False
@@ -43,6 +44,16 @@ def get_default_configs():
     optim.lr = 2e-4
     optim.weight_decay = 0.0
     optim.warmup = 150  # 5000
+
+    # Text encoder configuration (default for all body configs, can be overridden in specific configs)
+    # Options:
+    #   - 'clip': Original CLIP (77 tokens max) - default for backward compatibility
+    #   - 'sentence-bert': Sentence-BERT (~512 tokens) - recommended for long text
+    #   - 't5': T5 encoder (~512 tokens) - good for understanding
+    #   - 'longformer': Longformer (~4096 tokens) - for very long documents
+    config.text_encoder = text_encoder = ml_collections.ConfigDict()
+    text_encoder.type = 'sentence-bert'  # Default to CLIP for backward compatibility
+    text_encoder.model_name = None  # Uses default for each type, or specify: 'all-mpnet-base-v2', 't5-base', etc.
 
     config.seed = 42
 

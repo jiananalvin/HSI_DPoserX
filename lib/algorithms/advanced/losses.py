@@ -292,10 +292,19 @@ def get_step_fn(sde, train, optimize_fn=None,
                 pred_body = body_model(**{param: estimate})
                 loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))  # * 1000 convert m to mm
                 loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
+
+                # 🔍 DEBUG PRINT (print occasionally)
+                if torch.rand(1).item() < 0.01:  # ~1% of steps
+                    print(
+                        f"[LOSS DEBUG] "
+                        f"diffusion: {diffusion_loss.item():.3e} | "
+                        f"v2v: {loss_v2v.item():.3e} | "
+                        f"j2j: {loss_j2j.item():.3e} "
+                    )
                 
                 # Total loss: ONLY diffusion + v2v + j2j (recon losses NOT included)
                 # All losses now in consistent units: diffusion_loss (dimensionless) + v2v/j2j (mm²)
-                total_loss = diffusion_loss + loss_v2v + loss_j2j
+                total_loss = 1e-2 * diffusion_loss + 1e-4 *loss_v2v + 1e-4 *loss_j2j
                 
                 loss_dict = {
                     'loss': total_loss,  # Used for backprop (v2v/j2j in mm²)
