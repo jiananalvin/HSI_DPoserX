@@ -1,3 +1,4 @@
+from posix import truncate
 from configs.general_configs import get_general_configs
 import ml_collections
 
@@ -14,6 +15,7 @@ def get_default_configs():
     data.normalize = True
     data.rot_rep = 'axis'  # rot6d or axis
     data.min_max = False  # Z-score or min-max Normalize
+    data.include_global_orient = True  # Include global orientation (root rotation) in pose representation
 
     # training
     training = config.training
@@ -22,7 +24,7 @@ def get_default_configs():
     training.log_freq = 100   # Log every 100 iterations 
     training.eval_freq = 300  # 10000
     training.save_freq = 450  # 15000
-    training.auxiliary_loss = False  # not recommended
+    training.auxiliary_loss = True  # not recommended
     training.denoise_steps = 10  # for computing auxiliary loss
     training.render = True  # render results while validating
     training.likelihood_weighting = False

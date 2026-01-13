@@ -230,7 +230,8 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
 
 def get_step_fn(sde, train, optimize_fn=None, 
                 reduce_mean=False, continuous=True, likelihood_weighting=False, 
-                auxiliary_loss=False, denormalize=None, body_model=None, model_type='body', **kwargs):
+                auxiliary_loss=False, denormalize=None, body_model=None, model_type='body', 
+                include_global_orient=False, **kwargs):
     """Create one-step training/eval function (NO optimizer/step_counter args)."""
     # 🔴 REMOVED optimizer/step_counter args entirely (no assertion needed)
     if continuous:
@@ -283,13 +284,23 @@ def get_step_fn(sde, train, optimize_fn=None,
                 # diffusion_loss is PURE diffusion score matching loss (no recon losses included)
                 
                 weight = torch.log(1.0 + data_dict['SNR'])
-                estimate = denormalize(data_dict['clean_sample'], to_axis=True)
+                estimate_denorm = denormalize(data_dict['clean_sample'], to_axis=True)
                 batch_denorm = denormalize(batch, to_axis=True)
                 
-                # Auxiliary v2v/j2j loss (these ARE used for backprop)
-                # Convert positions to mm and compute loss (naturally gives mm²)
-                gt_body = body_model(**{param: batch_denorm})
-                pred_body = body_model(**{param: estimate})
+                # Handle global_orient if included
+                if include_global_orient:
+                    # Split concatenated poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
+                    global_orient_est = estimate_denorm[:, :3]
+                    body_pose_est = estimate_denorm[:, 3:]
+                    global_orient_gt = batch_denorm[:, :3]
+                    body_pose_gt = batch_denorm[:, 3:]
+                    # Pass both to BodyModel
+                    gt_body = body_model(global_orient=global_orient_gt, **{param: body_pose_gt})
+                    pred_body = body_model(global_orient=global_orient_est, **{param: body_pose_est})
+                else:
+                    # Original behavior: only body_pose
+                    gt_body = body_model(**{param: batch_denorm})
+                    pred_body = body_model(**{param: estimate_denorm})
                 loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))  # * 1000 convert m to mm
                 loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
 
@@ -304,7 +315,7 @@ def get_step_fn(sde, train, optimize_fn=None,
                 
                 # Total loss: ONLY diffusion + v2v + j2j (recon losses NOT included)
                 # All losses now in consistent units: diffusion_loss (dimensionless) + v2v/j2j (mm²)
-                total_loss = 1e-2 * diffusion_loss + 1e-4 *loss_v2v + 1e-4 *loss_j2j
+                total_loss = diffusion_loss + loss_v2v + loss_j2j
                 
                 loss_dict = {
                     'loss': total_loss,  # Used for backprop (v2v/j2j in mm²)

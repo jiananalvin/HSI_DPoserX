@@ -4,7 +4,14 @@
 
 ### [🔗 Project Page](https://dposer.github.io/) | [🎥 Video](https://youtu.be/yzwliadFcX0) | [📄 Paper](https://arxiv.org/abs/2508.00599)
 
-🎄 This is modified version I'm working on
+🎄 This is modified version I'm working on ...
+```
+# Train
+EXP_NAME="fintuneondposerx_2026_01_01" && nohup python -m run.trainer.body.diffusion -c configs.body.subvp.timefc.get_config --name $EXP_NAME --bodymodel-path ./body_models/smplx/SMPLX_NEUTRAL.npz --pretrained-ckpt ./pretrained_models/body/BaseMLP/last.ckpt > ${EXP_NAME}.log 2>&1 &
+
+# Test
+python run/tester/body/demo_ours.py -c configs.body.subvp.timefc.get_config --ckpt-path /home/jxudt/DPoser-X/checkpoints/dposer/amass/fintuneondposerx_bert_noaxloss_2026_01_03/last.ckpt
+```
 
 [Junzhe Lu](https://scholar.google.com/citations?user=907PxdcAAAAJ)<sup>1,\*</sup>, [Jing Lin](https://jinglin7.github.io/)<sup>2,\*</sup>, [Hongkun Dou](https://scholar.google.com/citations?user=pSNEkEwAAAAJ)<sup>3</sup>, [Ailing Zeng](https://ailingzeng.site)<sup>4</sup>, [Yue Deng](https://shi.buaa.edu.cn/yuedeng/en/index.htm)<sup>3</sup>, [Xian Liu](https://alvinliu0.github.io/)<sup>5</sup>, [Zhongang Cai](https://caizhongang.com/)<sup>6</sup>, [Lei Yang](https://www.yanglei.me/)<sup>6</sup>, [Yulun Zhang](http://yulunzhang.com/)<sup>7</sup>, [Haoqian Wang](https://www.sigs.tsinghua.edu.cn/whq_en/main.psp)<sup>1,†</sup>, [Ziwei Liu](https://liuziwei7.github.io/)<sup>2,†</sup>
 

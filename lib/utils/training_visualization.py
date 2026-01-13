@@ -122,8 +122,12 @@ def process_and_log_meshes(poses, bg_img, focal, princpt, tag_prefix,
         # Validate pose shape
         if poses.dim() == 2:
             batch_size, pose_dim_actual = poses.shape
-            if pose_dim_actual != 63:
-                print(f"⚠️ Pose dim mismatch: expected 63, got {pose_dim_actual} — truncating/padding!")
+            # Handle both 63D (body_pose only) and 66D (global_orient + body_pose)
+            if pose_dim_actual == 66:
+                # Extract body_pose only (skip first 3 dims which are global_orient)
+                poses = poses[:, 3:]
+            elif pose_dim_actual != 63:
+                print(f"⚠️ Pose dim mismatch: expected 63 or 66, got {pose_dim_actual} — truncating/padding!")
                 if pose_dim_actual > 63:
                     poses = poses[:, :63]
                 else:

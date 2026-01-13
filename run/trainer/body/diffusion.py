@@ -107,7 +107,10 @@ class DPoserTrainer(pl.LightningModule):
 
         # Diffusion model
         self.POSE_DIM = 3 if config.data.rot_rep == 'axis' else 6
-        self.model = create_model(config.model, N_POSES, self.POSE_DIM, text_embedding_dim=self.text_embedding_dim)
+        self.include_global_orient = getattr(config.data, 'include_global_orient', False)
+        # If including global orientation, add 1 more "pose" (the global root rotation)
+        effective_N_POSES = N_POSES + 1 if self.include_global_orient else N_POSES
+        self.model = create_model(config.model, effective_N_POSES, self.POSE_DIM, text_embedding_dim=self.text_embedding_dim)
         self.model_ema = None
 
         # Body models
@@ -133,7 +136,8 @@ class DPoserTrainer(pl.LightningModule):
 
         # SDE & sampling
         self.sde = self.setup_sde(config)
-        self.sampling_shape = (config.eval.batch_size, N_POSES * self.POSE_DIM)
+        effective_N_POSES = N_POSES + 1 if self.include_global_orient else N_POSES
+        self.sampling_shape = (config.eval.batch_size, effective_N_POSES * self.POSE_DIM)
         self.sampling_eps = 1e-3
         self.train_step_fn = None
         self.sampling_fn = None
@@ -212,8 +216,87 @@ class DPoserTrainer(pl.LightningModule):
                 rot_rep=self.config.data.rot_rep,
                 device=self.device
             )
-            self.normalize_fn = Normalizer.offline_normalize
-            self.denormalize_fn = Normalizer.offline_denormalize
+            
+            if self.include_global_orient:
+                # Create wrapper functions that normalize/denormalize global_orient and body_pose separately
+                def normalize_with_global_orient(poses, from_axis=False):
+                    """Normalize concatenated [global_orient, body_pose] by normalizing each separately."""
+                    if not self.config.data.normalize:
+                        return poses
+                    # Handle both [B, 66] and [B, H, 66] shapes (H = number of hypotheses)
+                    original_shape = poses.shape
+                    if len(poses.shape) == 3:
+                        # [B, H, 66] -> [B*H, 66]
+                        B, H, D = poses.shape
+                        poses = poses.reshape(B * H, D)
+                        reshape_back = True
+                    else:
+                        reshape_back = False
+                    
+                    # Split poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
+                    global_orient = poses[:, :3]
+                    body_pose = poses[:, 3:]
+                    # Normalize body_pose using existing normalizer
+                    body_pose_norm = Normalizer.offline_normalize(body_pose, from_axis=from_axis)
+                    # Normalize global_orient using simple stats (axis-angle typically in [-pi, pi])
+                    if self.config.data.min_max:
+                        # Min-max normalization: map [-pi, pi] to [-1, 1]
+                        import math
+                        global_orient_norm = global_orient / math.pi
+                    else:
+                        # Z-score: assume mean=0, std=1 (or use simple std from data)
+                        # For axis-angle rotations, std is typically around 1.0-1.5
+                        global_orient_norm = global_orient / 1.2  # Approximate std for axis-angle rotations
+                    result = torch.cat([global_orient_norm, body_pose_norm], dim=-1)
+                    
+                    # Reshape back if needed
+                    if reshape_back:
+                        result = result.reshape(original_shape)
+                    return result
+                
+                def denormalize_with_global_orient(poses, to_axis=False):
+                    """Denormalize concatenated [global_orient, body_pose] by denormalizing each separately."""
+                    if not self.config.data.normalize:
+                        return poses
+                    # Handle both [B, 66] and [B, H, 66] shapes (H = number of hypotheses)
+                    original_shape = poses.shape
+                    if len(poses.shape) == 3:
+                        # [B, H, 66] -> [B*H, 66]
+                        B, H, D = poses.shape
+                        poses = poses.reshape(B * H, D)
+                        reshape_back = True
+                    else:
+                        reshape_back = False
+                    
+                    # Split poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
+                    # Ensure we're working with 2D tensor
+                    assert len(poses.shape) == 2, f"Expected 2D tensor, got shape {poses.shape}"
+                    assert poses.shape[1] == 66, f"Expected 66D poses, got {poses.shape[1]}D"
+                    global_orient_norm = poses[:, :3].clone()  # Clone to ensure it's a separate tensor
+                    body_pose_norm = poses[:, 3:].clone()  # Clone to ensure it's a separate tensor
+                    assert body_pose_norm.shape[1] == 63, f"Expected 63D body_pose, got {body_pose_norm.shape[1]}D"
+                    
+                    # Denormalize body_pose using existing normalizer
+                    body_pose = Normalizer.offline_denormalize(body_pose_norm, to_axis=to_axis)
+                    # Denormalize global_orient
+                    if self.config.data.min_max:
+                        import math
+                        global_orient = global_orient_norm * math.pi
+                    else:
+                        global_orient = global_orient_norm * 1.2
+                    result = torch.cat([global_orient, body_pose], dim=-1)
+                    
+                    # Reshape back if needed
+                    if reshape_back:
+                        result = result.reshape(original_shape)
+                    return result
+                
+                self.normalize_fn = normalize_with_global_orient
+                self.denormalize_fn = denormalize_with_global_orient
+            else:
+                self.normalize_fn = Normalizer.offline_normalize
+                self.denormalize_fn = Normalizer.offline_denormalize
+            
             self.train_step_fn = self.setup_step_fn(self.config)
             self.val_step_fn = self.setup_step_fn_val(self.config)
             self.sampling_fn = sampling.get_sampling_fn(self.config, self.sde, self.sampling_shape,
@@ -234,7 +317,8 @@ class DPoserTrainer(pl.LightningModule):
             for param in body_model_train.parameters():
                 param.requires_grad = False
             aux_params = {'denormalize': self.denormalize_fn, 'body_model': body_model_train,
-                          'model_type': "body", 'denoise_steps': config.training.denoise_steps}
+                          'model_type': "body", 'denoise_steps': config.training.denoise_steps,
+                          'include_global_orient': self.include_global_orient}
             kwargs.update(aux_params)
         if config.training.random_mask:
             mask_params = {'min_mask_rate': config.training.min_mask_rate,
@@ -263,7 +347,8 @@ class DPoserTrainer(pl.LightningModule):
             for param in body_model_val.parameters():
                 param.requires_grad = False
             aux_params = {'denormalize': self.denormalize_fn, 'body_model': body_model_val,
-                        'model_type': "body", 'denoise_steps': config.training.denoise_steps}
+                        'model_type': "body", 'denoise_steps': config.training.denoise_steps,
+                        'include_global_orient': self.include_global_orient}
             kwargs.update(aux_params)
         if config.training.random_mask:
             mask_params = {'min_mask_rate': config.training.min_mask_rate,
@@ -301,8 +386,53 @@ class DPoserTrainer(pl.LightningModule):
         else:
             raise NotImplementedError(f"SDE {config.training.sde} unknown.")
 
+    def _concatenate_pose(self, global_orient, body_pose):
+        """Concatenate global_orient and body_pose into a single tensor."""
+        if self.include_global_orient:
+            # global_orient: [B, 3], body_pose: [B, 63] -> [B, 66]
+            return torch.cat([global_orient, body_pose], dim=-1)
+        else:
+            return body_pose
+    
+    def _split_pose(self, poses):
+        """Split concatenated poses into global_orient and body_pose.
+        
+        Handles both 2D [B, D] and 3D [B, H, D] tensors.
+        """
+        if self.include_global_orient:
+            if len(poses.shape) == 3:
+                # poses: [B, H, 66] -> global_orient: [B, H, 3], body_pose: [B, H, 63]
+                global_orient = poses[:, :, :3]
+                body_pose = poses[:, :, 3:]
+            else:
+                # poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
+                global_orient = poses[:, :3]
+                body_pose = poses[:, 3:]
+            return global_orient, body_pose
+        else:
+            return None, poses
+    
+    def _denormalize_and_split(self, poses, to_axis=True):
+        """Denormalize poses and split into global_orient and body_pose."""
+        denorm_poses = self.denormalize_fn(poses, to_axis=to_axis)
+        return self._split_pose(denorm_poses)
+    
+    def _get_body_model_kwargs(self, poses):
+        """Get kwargs for BodyModel from poses (handles global_orient if included)."""
+        global_orient, body_pose = self._split_pose(poses)
+        kwargs = {'body_pose': body_pose}
+        if global_orient is not None:
+            kwargs['global_orient'] = global_orient
+        return kwargs
+
     def training_step(self, batch, batch_idx):
-        poses = self.normalize_fn(batch['body_pose'], from_axis=True)
+        # Concatenate global_orient + body_pose if include_global_orient is True
+        if self.include_global_orient:
+            global_orient = batch.get('global_orient', torch.zeros(batch['body_pose'].shape[0], 3, device=batch['body_pose'].device))
+            poses = self._concatenate_pose(global_orient, batch['body_pose'])
+        else:
+            poses = batch['body_pose']
+        poses = self.normalize_fn(poses, from_axis=True)
         text_embeds = self.encode_text(batch['caption'])
         # Forward pass and calculate loss
         loss_dict = self.train_step_fn(self.model, batch=poses, condition=text_embeds, mask=None)
@@ -329,7 +459,13 @@ class DPoserTrainer(pl.LightningModule):
                                  self.config.training.continuous,)
     
     def validation_step(self, batch, batch_idx):
-        poses = self.normalize_fn(batch['body_pose'], from_axis=True)
+        # Concatenate global_orient + body_pose if include_global_orient is True
+        if self.include_global_orient:
+            global_orient = batch.get('global_orient', torch.zeros(batch['body_pose'].shape[0], 3, device=batch['body_pose'].device))
+            poses = self._concatenate_pose(global_orient, batch['body_pose'])
+        else:
+            poses = batch['body_pose']
+        poses = self.normalize_fn(poses, from_axis=True)
         text_list = batch['caption']  # Get raw text prompts (not embeddings)
         text_embeds_val = self.encode_text(text_list)
         
@@ -405,8 +541,9 @@ class DPoserTrainer(pl.LightningModule):
 
         '''     ******* Compute APD and SI *******     '''
         all_results = torch.cat(self.all_samples, dim=0)[:250]
-        body_pose = self.denormalize_fn(all_results, to_axis=True)
-        body_out = self.body_model_eval(body_pose=body_pose)
+        denorm_poses = self.denormalize_fn(all_results, to_axis=True)
+        body_model_kwargs = self._get_body_model_kwargs(denorm_poses)
+        body_out = self.body_model_eval(**body_model_kwargs)
         joints3d = body_out.Jtr
         body_joints3d = joints3d[:, :22, :]
         APD = average_pairwise_distance(body_joints3d)
@@ -431,7 +568,7 @@ class DPoserTrainer(pl.LightningModule):
         eval_metrics['bpd'] = bpd.mean().item()
 
         '''     ******* task2 completion *******     '''
-        mask, observation = create_mask(poses, part='left_leg', model='body')
+        mask, observation = create_mask(poses, part='left_leg', model='body', include_global_orient=self.include_global_orient)
 
         hypo_num = 10
         multihypo_denoise = []
@@ -440,10 +577,14 @@ class DPoserTrainer(pl.LightningModule):
             multihypo_denoise.append(completion)
         multihypo_denoise = torch.stack(multihypo_denoise, dim=1)
 
-        preds = self.denormalize_fn(multihypo_denoise, to_axis=True)
-        gts = self.denormalize_fn(poses, to_axis=True)
+        preds_denorm = self.denormalize_fn(multihypo_denoise, to_axis=True)
+        gts_denorm = self.denormalize_fn(poses, to_axis=True)
+        # Evaler expects body_pose only (it will handle global_orient internally if needed)
+        # Extract body_pose from concatenated poses if global_orient is included
+        _, preds_body_pose = self._split_pose(preds_denorm)
+        _, gts_body_pose = self._split_pose(gts_denorm)
         evaler = Evaler(body_model=self.body_model_vis, part='left_leg')
-        eval_results = evaler.multi_eval_bodys(preds, gts)
+        eval_results = evaler.multi_eval_bodys(preds_body_pose, gts_body_pose)
         eval_metrics['mpvpe'] = eval_results['mpvpe'].mean().item()
         eval_metrics['mpjpe'] = eval_results['mpjpe'].mean().item()
 
@@ -511,8 +652,11 @@ class DPoserTrainer(pl.LightningModule):
             condition=text_embed
         )
         
-        generated_pose = self.denormalize_fn(samples[0], to_axis=True)  # [21, 3]
-        return generated_pose
+        generated_pose_denorm = self.denormalize_fn(samples[0], to_axis=True)
+        # Return body_pose only (for backward compatibility)
+        # If global_orient is included, it's the first 3 dims, body_pose is the rest
+        _, generated_pose = self._split_pose(generated_pose_denorm.unsqueeze(0))
+        return generated_pose.squeeze(0)  # [21, 3] or [22, 3] if global_orient included
 
 
 def main(args, config, try_resume):
