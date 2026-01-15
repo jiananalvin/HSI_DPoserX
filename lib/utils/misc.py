@@ -36,11 +36,11 @@ def add_noise(gts, std=0.5, noise_type='gaussian'):
     return gts
 
 
-def create_mask(body_poses, part='legs', model='body', observation_type='noise', include_global_orient=False):
+def create_mask(body_poses, part='legs', model='body', observation_type='noise'):
     # body_poses: [batchsize, 3*N_POSES] (axis-angle) or [batchsize, 6*N_POSES] (rot6d)
-    # If include_global_orient=True, body_poses includes global orientation: [batchsize, 3*(N_POSES+1)] or [batchsize, 6*(N_POSES+1)]
+    # Always includes global orientation: [batchsize, 3*22] or [batchsize, 6*22] (22 = 1 global + 21 body joints)
     if model == 'body':
-        N_POSES = 21
+        N_POSES = 21  # Body joints only (global orientation is separate)
         PartIndices = BodyPartIndices
     elif model == 'hand':
         N_POSES = 15
@@ -48,16 +48,16 @@ def create_mask(body_poses, part='legs', model='body', observation_type='noise',
     else:
         raise ValueError(f'Unknown model: {model}')
     
-    # Adjust N_POSES if global orientation is included
-    effective_N_POSES = N_POSES + 1 if include_global_orient else N_POSES
+    # Global orientation is always included: effective_N_POSES = N_POSES + 1 = 22
+    effective_N_POSES = N_POSES + 1
     assert len(body_poses.shape) == 2 and body_poses.shape[1] % effective_N_POSES == 0
     rot_N = body_poses.shape[1] // effective_N_POSES
     assert rot_N in [3, 6]
 
     mask_joints = PartIndices.get_indices(part)
     mask = body_poses.new_ones(body_poses.shape, dtype=torch.bool)
-    # If global orientation is included, offset joint indices by 1 (skip global orientation at index 0)
-    joint_offset = 1 if include_global_orient else 0
+    # Always offset joint indices by 1 (skip global orientation at index 0)
+    joint_offset = 1
     mask_indices = (torch.tensor(mask_joints, dtype=torch.long) + joint_offset).view(-1, 1) * rot_N + torch.arange(rot_N).view(1, -1)
     mask_indices = mask_indices.flatten()
     mask[:, mask_indices] = 0
@@ -75,28 +75,18 @@ def create_mask(body_poses, part='legs', model='body', observation_type='noise',
         rot6d_body_poses = torch.tensor(smpl_mean_params['pose'][6:,], dtype=torch.float32, device=body_poses.device)  # [138]
         axis_body_pose = rot6d_to_axis_angle(rot6d_body_poses.reshape(-1, 6)).reshape(-1)   # [69]
         # Mean pose is body-only (doesn't include global orientation)
-        # If global_orient is included, mask_indices point to body joints (already offset by joint_offset)
-        # So we need to map mask_indices back to body-only indices for mean pose
-        if include_global_orient:
-            # mask_indices are absolute positions in [global_orient (rot_N), body_pose (N_POSES*rot_N)]
-            # They already skip global_orient (first rot_N dims) due to joint_offset
-            # So mask_indices >= rot_N, and we need to subtract rot_N to get body-only indices
-            # Filter out any indices that might be in global_orient range (shouldn't happen, but safety check)
-            body_mask_indices = mask_indices[mask_indices >= rot_N] - rot_N
-            # Only update the body joint indices (skip global_orient indices if any)
-            valid_mask_indices = mask_indices[mask_indices >= rot_N]
-            if len(valid_mask_indices) > 0:
-                if rot_N == 3:
-                    observation[:, valid_mask_indices] = axis_body_pose[None, body_mask_indices].repeat(batch_size, 1)
-                elif rot_N == 6:
-                    observation[:, valid_mask_indices] = rot6d_body_poses[None, body_mask_indices].repeat(batch_size, 1)
-                else:
-                    raise NotImplementedError
-        else:
+        # mask_indices are absolute positions in [global_orient (rot_N), body_pose (N_POSES*rot_N)]
+        # They already skip global_orient (first rot_N dims) due to joint_offset=1
+        # So mask_indices >= rot_N, and we need to subtract rot_N to get body-only indices
+        # Filter out any indices that might be in global_orient range (shouldn't happen, but safety check)
+        body_mask_indices = mask_indices[mask_indices >= rot_N] - rot_N
+        # Only update the body joint indices (skip global_orient indices if any)
+        valid_mask_indices = mask_indices[mask_indices >= rot_N]
+        if len(valid_mask_indices) > 0:
             if rot_N == 3:
-                observation[:, mask_indices] = axis_body_pose[None, mask_indices].repeat(batch_size, 1)
+                observation[:, valid_mask_indices] = axis_body_pose[None, body_mask_indices].repeat(batch_size, 1)
             elif rot_N == 6:
-                observation[:, mask_indices] = rot6d_body_poses[None, mask_indices].repeat(batch_size, 1)
+                observation[:, valid_mask_indices] = rot6d_body_poses[None, body_mask_indices].repeat(batch_size, 1)
             else:
                 raise NotImplementedError
 

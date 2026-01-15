@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from lib.body_model.utils import BodyPartIndices, BodySegIndices
 from lib.dataset.body.AMASS import AMASSDataset
 
-N_POSES = 21
+N_POSES = 22  # 21 body joints + 1 global orientation (root rotation)
 
 
 class AMASSDataModule(pl.LightningDataModule):

@@ -16,10 +16,24 @@ class Posenormalizer:
             normalize_params = torch.load(os.path.join(data_path, '{}_normalize1.pt'.format(rot_rep)))
             self.min_poses, self.max_poses = normalize_params['min_poses'].to(device), normalize_params['max_poses'].to(
                 device)
+            # Load global_orient statistics if available (for backward compatibility, use None if not present)
+            if 'min_global_orient' in normalize_params:
+                self.min_global_orient = normalize_params['min_global_orient'].to(device)
+                self.max_global_orient = normalize_params['max_global_orient'].to(device)
+            else:
+                self.min_global_orient = None
+                self.max_global_orient = None
         else:
             normalize_params = torch.load(os.path.join(data_path, '{}_normalize2.pt'.format(rot_rep)))
             self.mean_poses, self.std_poses = normalize_params['mean_poses'].to(device), normalize_params[
                 'std_poses'].to(device)
+            # Load global_orient statistics if available (for backward compatibility, use None if not present)
+            if 'mean_global_orient' in normalize_params:
+                self.mean_global_orient = normalize_params['mean_global_orient'].to(device)
+                self.std_global_orient = normalize_params['std_global_orient'].to(device)
+            else:
+                self.mean_global_orient = None
+                self.std_global_orient = None
 
     def offline_normalize(self, poses, from_axis=False):
         assert len(poses.shape) == 2 or len(poses.shape) == 3  # [b, data_dim] or [t, b, data_dim]
@@ -89,6 +103,78 @@ class Posenormalizer:
             denormalized_poses = rot6d_to_axis_angle(denormalized_poses.reshape(-1, 6)).reshape(*pose_shape[:-1], -1)
 
         return denormalized_poses
+
+    def offline_normalize_global_orient(self, global_orient):
+        """Normalize global orientation (3D) using pre-computed statistics."""
+        if not self.normalize:
+            return global_orient
+        
+        assert global_orient.shape[-1] == 3, f"Expected 3D global_orient, got shape {global_orient.shape}"
+        
+        if self.min_max:
+            if self.min_global_orient is None:
+                raise ValueError("Global orientation statistics not found. Please recompute normalization params with global_orient=True")
+            min_go = self.min_global_orient.view(1, -1)
+            max_go = self.max_global_orient.view(1, -1)
+            
+            if len(global_orient.shape) == 3:  # [t, b, 3]
+                min_go = min_go.unsqueeze(0)
+                max_go = max_go.unsqueeze(0)
+            
+            min_go = min_go.to(global_orient.device)
+            max_go = max_go.to(global_orient.device)
+            normalized = 2 * (global_orient - min_go) / (max_go - min_go + 1e-8) - 1
+        else:
+            if self.mean_global_orient is None:
+                raise ValueError("Global orientation statistics not found. Please recompute normalization params with global_orient=True")
+            mean_go = self.mean_global_orient.view(1, -1)
+            std_go = self.std_global_orient.view(1, -1)
+            
+            if len(global_orient.shape) == 3:  # [t, b, 3]
+                mean_go = mean_go.unsqueeze(0)
+                std_go = std_go.unsqueeze(0)
+            
+            mean_go = mean_go.to(global_orient.device)
+            std_go = std_go.to(global_orient.device)
+            normalized = (global_orient - mean_go) / std_go
+        
+        return normalized
+
+    def offline_denormalize_global_orient(self, global_orient):
+        """Denormalize global orientation (3D) using pre-computed statistics."""
+        if not self.normalize:
+            return global_orient
+        
+        assert global_orient.shape[-1] == 3, f"Expected 3D global_orient, got shape {global_orient.shape}"
+        
+        if self.min_max:
+            if self.min_global_orient is None:
+                raise ValueError("Global orientation statistics not found. Please recompute normalization params with global_orient=True")
+            min_go = self.min_global_orient.view(1, -1)
+            max_go = self.max_global_orient.view(1, -1)
+            
+            if len(global_orient.shape) == 3:  # [t, b, 3]
+                min_go = min_go.unsqueeze(0)
+                max_go = max_go.unsqueeze(0)
+            
+            min_go = min_go.to(global_orient.device)
+            max_go = max_go.to(global_orient.device)
+            denormalized = 0.5 * ((global_orient + 1) * (max_go - min_go) + 2 * min_go)
+        else:
+            if self.mean_global_orient is None:
+                raise ValueError("Global orientation statistics not found. Please recompute normalization params with global_orient=True")
+            mean_go = self.mean_global_orient.view(1, -1)
+            std_go = self.std_global_orient.view(1, -1)
+            
+            if len(global_orient.shape) == 3:  # [t, b, 3]
+                mean_go = mean_go.unsqueeze(0)
+                std_go = std_go.unsqueeze(0)
+            
+            mean_go = mean_go.to(global_orient.device)
+            std_go = std_go.to(global_orient.device)
+            denormalized = global_orient * std_go + mean_go
+        
+        return denormalized
 
 
 class CombinedNormalizer:
@@ -164,11 +250,26 @@ class CombinedNormalizer:
 
 def calculate_normalize_params(dataset, data_key='', rot_rep='axis', min_max=False,
                                batch_size=12800, num_workers=16, output_dir='', split_num=1):
+    """
+    Calculate normalization parameters for poses and global orientation.
+    Global orientation is always included (always computed).
+    
+    Args:
+        dataset: Dataset to compute statistics from
+        data_key: Key for pose data in dataset batch (e.g., 'body_pose')
+        rot_rep: Rotation representation ('axis' or 'rot6d')
+        min_max: If True, use min-max normalization; else use z-score (mean/std)
+        batch_size: Batch size for DataLoader
+        num_workers: Number of workers for DataLoader
+        output_dir: Directory to save normalization files
+        split_num: Number of splits for memory-efficient computation
+    """
     torch.multiprocessing.set_sharing_strategy('file_system')
     os.makedirs(output_dir, exist_ok=True)
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, drop_last=False)
 
     all_data = []
+    all_global_orient = []
 
     for batch in tqdm(dataloader, desc='fetching params'):
         poses = batch[data_key]
@@ -176,6 +277,17 @@ def calculate_normalize_params(dataset, data_key='', rot_rep='axis', min_max=Fal
         if rot_rep == 'rot6d':
             poses = axis_angle_to_rot6d(poses.reshape(-1, 3)).reshape(*pose_shape[:-1], -1)
         all_data.append(poses)
+        
+        # Always compute global_orient statistics
+        if 'global_orient' in batch:
+            global_orient = batch['global_orient']
+            if isinstance(global_orient, torch.Tensor):
+                all_global_orient.append(global_orient)
+            else:
+                all_global_orient.append(torch.tensor(global_orient, dtype=torch.float32))
+        else:
+            print("Warning: 'global_orient' not found in batch. Using zeros for global_orient statistics.")
+            all_global_orient.append(torch.zeros(3, dtype=torch.float32))
 
     all_data_concat = torch.cat(all_data, dim=0)
     num_samples = all_data_concat.shape[0]
@@ -192,9 +304,26 @@ def calculate_normalize_params(dataset, data_key='', rot_rep='axis', min_max=Fal
             torch.cuda.empty_cache()
         min_percentile = torch.min(torch.stack(min_values), dim=0).values.cpu()
         max_percentile = torch.max(torch.stack(max_values), dim=0).values.cpu()
-        torch.save({'min_poses': min_percentile,
-                    'max_poses': max_percentile},
-                   os.path.join(output_dir, f'{rot_rep}_normalize1.pt'))
+        
+        save_dict = {'min_poses': min_percentile, 'max_poses': max_percentile}
+        
+        # Always compute global_orient statistics
+        global_orient_concat = torch.cat(all_global_orient, dim=0)
+        min_go_values = []
+        max_go_values = []
+        go_split_size = global_orient_concat.shape[0] // split_num
+        for i in range(split_num):
+            split_go = global_orient_concat[i * go_split_size:(i + 1) * go_split_size].cuda()
+            min_go_values.append(torch.quantile(split_go, 0.001, dim=0))
+            max_go_values.append(torch.quantile(split_go, 0.999, dim=0))
+            torch.cuda.empty_cache()
+        min_go_percentile = torch.min(torch.stack(min_go_values), dim=0).values.cpu()
+        max_go_percentile = torch.max(torch.stack(max_go_values), dim=0).values.cpu()
+        save_dict['min_global_orient'] = min_go_percentile
+        save_dict['max_global_orient'] = max_go_percentile
+        print(f'   Global orient range: min={min_go_percentile.numpy()}, max={max_go_percentile.numpy()}')
+        
+        torch.save(save_dict, os.path.join(output_dir, f'{rot_rep}_normalize1.pt'))
     else:  # mean and std
         means = []
         stds = []
@@ -205,9 +334,26 @@ def calculate_normalize_params(dataset, data_key='', rot_rep='axis', min_max=Fal
             torch.cuda.empty_cache()
         mean_poses = torch.mean(torch.stack(means), dim=0).cpu()
         std_poses = torch.sqrt(torch.mean(torch.stack(stds) ** 2, dim=0)).cpu()  # Aggregate stds
-        torch.save({'mean_poses': mean_poses,
-                    'std_poses': std_poses},
-                   os.path.join(output_dir, f'{rot_rep}_normalize2.pt'))
+        
+        save_dict = {'mean_poses': mean_poses, 'std_poses': std_poses}
+        
+        # Always compute global_orient statistics
+        global_orient_concat = torch.cat(all_global_orient, dim=0)
+        go_means = []
+        go_stds = []
+        go_split_size = global_orient_concat.shape[0] // split_num
+        for i in range(split_num):
+            split_go = global_orient_concat[i * go_split_size:(i + 1) * go_split_size].cuda()
+            go_means.append(torch.mean(split_go, dim=0))
+            go_stds.append(torch.std(split_go, dim=0))
+            torch.cuda.empty_cache()
+        mean_go = torch.mean(torch.stack(go_means), dim=0).cpu()
+        std_go = torch.sqrt(torch.mean(torch.stack(go_stds) ** 2, dim=0)).cpu()
+        save_dict['mean_global_orient'] = mean_go
+        save_dict['std_global_orient'] = std_go
+        print(f'   Global orient stats: mean={mean_go.numpy()}, std={std_go.numpy()}')
+        
+        torch.save(save_dict, os.path.join(output_dir, f'{rot_rep}_normalize2.pt'))
     torch.cuda.empty_cache()
 
     print(f'normalize params saved to {output_dir}')

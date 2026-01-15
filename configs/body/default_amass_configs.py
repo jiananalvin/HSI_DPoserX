@@ -1,4 +1,3 @@
-from posix import truncate
 from configs.general_configs import get_general_configs
 import ml_collections
 
@@ -15,7 +14,6 @@ def get_default_configs():
     data.normalize = True
     data.rot_rep = 'axis'  # rot6d or axis
     data.min_max = False  # Z-score or min-max Normalize
-    data.include_global_orient = True  # Include global orientation (root rotation) in pose representation
 
     # training
     training = config.training

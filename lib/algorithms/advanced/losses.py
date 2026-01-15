@@ -230,8 +230,7 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
 
 def get_step_fn(sde, train, optimize_fn=None, 
                 reduce_mean=False, continuous=True, likelihood_weighting=False, 
-                auxiliary_loss=False, denormalize=None, body_model=None, model_type='body', 
-                include_global_orient=False, **kwargs):
+                auxiliary_loss=False, denormalize=None, body_model=None, model_type='body', **kwargs):  # Always include global orientation
     """Create one-step training/eval function (NO optimizer/step_counter args)."""
     # 🔴 REMOVED optimizer/step_counter args entirely (no assertion needed)
     if continuous:
@@ -287,22 +286,16 @@ def get_step_fn(sde, train, optimize_fn=None,
                 estimate_denorm = denormalize(data_dict['clean_sample'], to_axis=True)
                 batch_denorm = denormalize(batch, to_axis=True)
                 
-                # Handle global_orient if included
-                if include_global_orient:
-                    # Split concatenated poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
-                    global_orient_est = estimate_denorm[:, :3]
-                    body_pose_est = estimate_denorm[:, 3:]
-                    global_orient_gt = batch_denorm[:, :3]
-                    body_pose_gt = batch_denorm[:, 3:]
-                    # Pass both to BodyModel
-                    gt_body = body_model(global_orient=global_orient_gt, **{param: body_pose_gt})
-                    pred_body = body_model(global_orient=global_orient_est, **{param: body_pose_est})
-                else:
-                    # Original behavior: only body_pose
-                    gt_body = body_model(**{param: batch_denorm})
-                    pred_body = body_model(**{param: estimate_denorm})
-                loss_v2v = torch.mean(weight * l2_loss(gt_body.v * 1000, pred_body.v * 1000).sum(dim=-1))  # * 1000 convert m to mm
-                loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr * 1000, pred_body.Jtr * 1000).sum(dim=-1))
+                # Always split concatenated poses: [B, 66] -> global_orient: [B, 3], body_pose: [B, 63]
+                global_orient_est = estimate_denorm[:, :3]
+                body_pose_est = estimate_denorm[:, 3:]
+                global_orient_gt = batch_denorm[:, :3]
+                body_pose_gt = batch_denorm[:, 3:]
+                # Pass both to BodyModel
+                gt_body = body_model(global_orient=global_orient_gt, **{param: body_pose_gt})
+                pred_body = body_model(global_orient=global_orient_est, **{param: body_pose_est})
+                loss_v2v = torch.mean(weight * l2_loss(gt_body.v, pred_body.v).sum(dim=-1))  # * 1000 convert m to mm
+                loss_j2j = torch.mean(weight * l2_loss(gt_body.Jtr, pred_body.Jtr).sum(dim=-1))
 
                 # 🔍 DEBUG PRINT (print occasionally)
                 if torch.rand(1).item() < 0.01:  # ~1% of steps
